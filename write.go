@@ -25,7 +25,6 @@ import (
 	"math"
 	"time"
 
-	"seehuhn.de/go/geom/rect"
 	"seehuhn.de/go/postscript/funit"
 
 	"seehuhn.de/go/sfnt/cff"
@@ -35,6 +34,7 @@ import (
 	"seehuhn.de/go/sfnt/head"
 	"seehuhn.de/go/sfnt/header"
 	"seehuhn.de/go/sfnt/hmtx"
+	"seehuhn.de/go/sfnt/internal/clamp"
 	"seehuhn.de/go/sfnt/maxp"
 	"seehuhn.de/go/sfnt/name"
 	"seehuhn.de/go/sfnt/os2"
@@ -58,7 +58,10 @@ func (f *Font) Write(w io.Writer) (int64, error) {
 	// returned tables are clones; the caller's Font is never mutated.
 	fvarTable, statTable, nameExtra := f.assignVariationNameIDs()
 
-	hheaData, hmtxData := f.makeHmtx()
+	hheaData, hmtxData, err := f.makeHmtx()
+	if err != nil {
+		return 0, err
+	}
 	tableData["hhea"] = hheaData
 	tableData["hmtx"] = hmtxData
 
@@ -213,7 +216,12 @@ func (f *Font) WriteTrueTypePDF(w io.Writer, extraTables ...any) (int64, error) 
 	if f.CMapTable != nil {
 		tableData["cmap"] = f.CMapTable.Encode()
 	}
-	tableData["hhea"], tableData["hmtx"] = f.makeHmtx()
+	hheaData, hmtxData, err := f.makeHmtx()
+	if err != nil {
+		return 0, err
+	}
+	tableData["hhea"] = hheaData
+	tableData["hmtx"] = hmtxData
 	enc := outlines.Glyphs.Encode()
 	tableData["glyf"] = enc.GlyfData
 	tableData["loca"] = enc.LocaData
@@ -287,18 +295,6 @@ func (f *Font) checkUnitsPerEm() error {
 	return nil
 }
 
-// bboxRect16 rounds a design-unit bounding box outwards to the integer type
-// used by the "head" table, so that the stored box still contains every glyph.
-func bboxRect16(b rect.Rect) funit.Rect16 {
-	b = b.Rounded()
-	return funit.Rect16{
-		LLx: clampInt16(b.LLx),
-		LLy: clampInt16(b.LLy),
-		URx: clampInt16(b.URx),
-		URy: clampInt16(b.URy),
-	}
-}
-
 func (f *Font) makeHead(locaFormat int16) []byte {
 	headInfo := head.Info{
 		FontRevision:  f.Version,
@@ -307,7 +303,7 @@ func (f *Font) makeHead(locaFormat int16) []byte {
 		UnitsPerEm:    f.UnitsPerEm,
 		Created:       f.CreationTime,
 		Modified:      f.ModificationTime,
-		FontBBox:      bboxRect16(f.FontBBox()),
+		FontBBox:      clamp.Rect16(f.FontBBox()),
 		IsBold:        f.IsBold,
 		IsItalic:      f.IsItalic,
 		LowestRecPPEM: 7, // TODO(voss)
@@ -316,38 +312,35 @@ func (f *Font) makeHead(locaFormat int16) []byte {
 	return headInfo.Encode()
 }
 
-func (f *Font) makeHmtx() ([]byte, []byte) {
+// makeHmtx builds the "hhea" and "hmtx" tables.  An advance width the "hmtx"
+// table cannot hold is an error; fonts read from a file are repaired on read,
+// so such a width came from the caller.
+func (f *Font) makeHmtx() ([]byte, []byte, error) {
 	// The hmtx table stores widths and bboxes in UnitsPerEm units.  For CFF
 	// outlines that requires applying the (possibly per-FD) font matrix; the
 	// PDF helpers handle this, so derive UnitsPerEm values from there.
 	upm := float64(f.UnitsPerEm)
 	widths := make([]funit.Uint16, f.NumGlyphs())
 	for i, w := range f.WidthsPDF() {
-		// advance widths are UFWORD; clamp to the representable range
-		v := math.Round(w * upm)
-		v = max(0, min(v, 0xFFFF))
-		widths[i] = funit.Uint16(v)
+		h, ok := hmtxAdvance(w, upm)
+		if !ok {
+			return nil, nil, fmt.Errorf("sfnt: advance width %g of glyph %d outside the hmtx range", w*upm, i)
+		}
+		widths[i] = h
 	}
 
 	bboxScale := upm / 1000
 	extents := make([]funit.Rect16, f.NumGlyphs())
 	for i, b := range f.GlyphBBoxesPDF() {
 		extents[i] = funit.Rect16{
-			LLx: funit.Int16(math.Round(b.LLx * bboxScale)),
-			LLy: funit.Int16(math.Round(b.LLy * bboxScale)),
-			URx: funit.Int16(math.Round(b.URx * bboxScale)),
-			URy: funit.Int16(math.Round(b.URy * bboxScale)),
+			LLx: clamp.Int16[funit.Int16](math.Round(b.LLx * bboxScale)),
+			LLy: clamp.Int16[funit.Int16](math.Round(b.LLy * bboxScale)),
+			URx: clamp.Int16[funit.Int16](math.Round(b.URx * bboxScale)),
+			URy: clamp.Int16[funit.Int16](math.Round(b.URy * bboxScale)),
 		}
 	}
 
-	hheaAscent := f.HheaAscent
-	hheaDescent := f.HheaDescent
-	hheaLineGap := f.HheaLineGap
-	if hheaAscent == 0 && hheaDescent == 0 && hheaLineGap == 0 {
-		hheaAscent = f.Ascent
-		hheaDescent = f.Descent
-		hheaLineGap = f.LineGap
-	}
+	hheaAscent, hheaDescent, hheaLineGap := f.hheaMetrics()
 
 	hmtxInfo := &hmtx.Info{
 		Widths:       widths,
@@ -358,7 +351,8 @@ func (f *Font) makeHmtx() ([]byte, []byte) {
 		CaretAngle:   f.ItalicAngle / 180 * math.Pi,
 	}
 
-	return hmtxInfo.Encode()
+	hheaData, hmtxData := hmtxInfo.Encode()
+	return hheaData, hmtxData, nil
 }
 
 func (f *Font) makeOS2() []byte {
@@ -396,15 +390,7 @@ func (f *Font) makeOS2() []byte {
 		}
 	}
 
-	winAscent := f.WinAscent
-	winDescent := f.WinDescent
-	if winAscent == 0 && winDescent == 0 {
-		bbox := f.FontBBox()
-		winAscent = clampInt16(math.Ceil(bbox.URy))
-		winDescent = clampInt16(math.Ceil(-bbox.LLy))
-		// TODO(voss): larger values may be needed, if GPOS rules move some
-		// glyphs outside this range.
-	}
+	winAscent, winDescent := f.winMetrics()
 
 	os2Info := &os2.Info{
 		WeightClass: f.Weight,
@@ -426,7 +412,7 @@ func (f *Font) makeOS2() []byte {
 		CapHeight:  f.CapHeight,
 		XHeight:    f.XHeight,
 
-		AvgGlyphWidth: funit.Int16(avgGlyphWidth),
+		AvgGlyphWidth: clamp.Int16[funit.Int16](float64(avgGlyphWidth)),
 
 		FamilyClass: familyClass,
 

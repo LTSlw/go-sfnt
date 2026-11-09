@@ -27,13 +27,18 @@ import (
 	"golang.org/x/image/font/gofont/gobolditalic"
 	"golang.org/x/image/font/gofont/goregular"
 
+	"seehuhn.de/go/geom/matrix"
+	"seehuhn.de/go/postscript/cid"
+	"seehuhn.de/go/postscript/funit"
 	"seehuhn.de/go/postscript/type1"
 
 	"seehuhn.de/go/sfnt"
 	"seehuhn.de/go/sfnt/cff"
 	"seehuhn.de/go/sfnt/fvar"
 	"seehuhn.de/go/sfnt/glyph"
+	"seehuhn.de/go/sfnt/head"
 	"seehuhn.de/go/sfnt/header"
+	"seehuhn.de/go/sfnt/hmtx"
 	"seehuhn.de/go/sfnt/internal/debug"
 	"seehuhn.de/go/sfnt/name"
 	"seehuhn.de/go/sfnt/os2"
@@ -249,9 +254,9 @@ func FuzzFont(f *testing.F) {
 }
 
 // fontCmpOptions returns the options for comparing two fonts read from either
-// end of a write-read cycle.  ref supplies the glyph count and units per em
-// the comparison is measured against; the two fonts agree on both, or the
-// comparison reports that first.
+// end of a write-read cycle.  ref supplies the glyph count the comparison is
+// measured against; the two fonts agree on it, or the comparison reports that
+// first.
 func fontCmpOptions(ref *sfnt.Font) cmp.Options {
 	cmpFDSelectFn := cmp.Comparer(func(fn1, fn2 cff.FDSelectFn) bool {
 		for gid := range ref.NumGlyphs() {
@@ -265,23 +270,7 @@ func fontCmpOptions(ref *sfnt.Font) cmp.Options {
 		d := math.Max(math.Abs(x1), math.Abs(x2)) * 1e-8
 		return math.Abs(x2-x1) <= d
 	})
-	// CFF glyph widths are constrained to the hmtx table's precision, which
-	// stores advance widths as integers in font design units (UnitsPerEm).
-	// At UnitsPerEm != 1000 a CFF-glyph-space width therefore round-trips to
-	// the nearest representable value, so compare the quantised hmtx widths
-	// rather than the raw glyph-space widths.
-	upm := float64(ref.UnitsPerEm)
-	toHmtx := func(w float64) int {
-		// mirror makeHmtx: quantise and clamp to the UFWORD range
-		return int(max(0, min(math.Round(w*upm/1000), 0xFFFF)))
-	}
-	cmpGlyphWidth := cmp.Comparer(func(g1, g2 *cff.Glyph) bool {
-		if g1.Name != g2.Name {
-			return false
-		}
-		return toHmtx(g1.Width) == toHmtx(g2.Width)
-	})
-	return cmp.Options{cmpFDSelectFn, cmpFloat, cmpGlyphWidth}
+	return cmp.Options{cmpFDSelectFn, cmpFloat}
 }
 
 // The PostScript name must survive embedding in a PDF file: the TrueType
@@ -413,6 +402,21 @@ func isASCII(s string) bool {
 func fontWithPostScriptName(t *testing.T, font *sfnt.Font, psName string) []byte {
 	t.Helper()
 
+	return editTables(t, font, func(tables map[string][]byte) {
+		nameInfo, err := name.Decode(tables["name"])
+		if err != nil {
+			t.Fatal(err)
+		}
+		nameInfo.Windows["en-US"].PostScriptName = psName
+		tables["name"] = nameInfo.Encode(1)
+	})
+}
+
+// editTables writes font to a font file, lets edit change the tables of the
+// file, and returns the font file which holds the changed tables.
+func editTables(t *testing.T, font *sfnt.Font, edit func(tables map[string][]byte)) []byte {
+	t.Helper()
+
 	buf := &bytes.Buffer{}
 	if _, err := font.Write(buf); err != nil {
 		t.Fatal(err)
@@ -431,12 +435,7 @@ func fontWithPostScriptName(t *testing.T, font *sfnt.Font, psName string) []byte
 		tables[tag] = data
 	}
 
-	nameInfo, err := name.Decode(tables["name"])
-	if err != nil {
-		t.Fatal(err)
-	}
-	nameInfo.Windows["en-US"].PostScriptName = psName
-	tables["name"] = nameInfo.Encode(1)
+	edit(tables)
 
 	out := &bytes.Buffer{}
 	if _, err := header.Write(out, hdr.ScalerType, tables); err != nil {
@@ -558,6 +557,74 @@ func TestFontNamePrefersNameTableEntry6(t *testing.T) {
 	}
 }
 
+// Some fonts give only the subfamily in their Windows records and keep the
+// family, full name and PostScript name in the Macintosh records.  Each
+// entry missing from the preferred table is taken from the other platform,
+// and the names survive a write and a second read.
+func TestNamesSpreadOverPlatforms(t *testing.T) {
+	font := debug.MakeSimpleFont()
+	nameInfo := &name.Info{
+		Mac: name.Tables{"en": {
+			Family:         "Quire Sans",
+			Subfamily:      "Roman",
+			FullName:       "Quire Sans",
+			PostScriptName: "QuireSans",
+		}},
+		Windows: name.Tables{"en-US": {Subfamily: "Regular"}},
+	}
+	data := editTables(t, font, func(tables map[string][]byte) {
+		tables["name"] = nameInfo.Encode(1)
+	})
+
+	type names struct{ Family, Subfamily, FullName, FontName string }
+	want := names{"Quire Sans", "Regular", "Quire Sans", "QuireSans"}
+
+	font2 := readBack(t, data)
+	got := names{font2.FamilyName, font2.Subfamily, font2.FullName, font2.FontName}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("names (-want +got):\n%s", diff)
+	}
+
+	buf := &bytes.Buffer{}
+	if _, err := font2.Write(buf); err != nil {
+		t.Fatal(err)
+	}
+	font3 := readBack(t, buf.Bytes())
+	got3 := names{font3.FamilyName, font3.Subfamily, font3.FullName, font3.FontName}
+	if diff := cmp.Diff(want, got3); diff != "" {
+		t.Errorf("round trip failed (-want +got):\n%s", diff)
+	}
+}
+
+// Names from the other platform fill gaps only if they are in a language
+// close to the one wanted.
+func TestNamesFallbackLanguage(t *testing.T) {
+	font := debug.MakeSimpleFont()
+	font.FontName = "Quire-Regular"
+	nameInfo := &name.Info{
+		Mac: name.Tables{"de": {
+			Family:    "Quire Grotesk",
+			Subfamily: "Normal",
+		}},
+		Windows: name.Tables{"en-US": {
+			Subfamily:      "Regular",
+			PostScriptName: "Quire-Regular",
+		}},
+	}
+	data := editTables(t, font, func(tables map[string][]byte) {
+		tables["name"] = nameInfo.Encode(1)
+	})
+
+	// the family comes from the CFF font program, not the German record
+	font2 := readBack(t, data)
+	if got, want := font2.FamilyName, font.FamilyName; got != want {
+		t.Errorf("family name = %q, want %q", got, want)
+	}
+	if got, want := font2.Subfamily, "Regular"; got != want {
+		t.Errorf("subfamily = %q, want %q", got, want)
+	}
+}
+
 // Entry 6 cannot hold every PostScript name, and a font whose name it cannot
 // hold has no entry 6 at all.  The CFF Name INDEX is then the only record of
 // the name, as it is in an OpenType/CFF font embedded in a PDF file, where the
@@ -637,5 +704,274 @@ func TestWriteRejectsInvalidInstanceNames(t *testing.T) {
 	font.Fvar.Instances[0].PostScriptName = "Quire (Regular)"
 	if _, err := font.Write(&bytes.Buffer{}); err == nil {
 		t.Error("Write with invalid instance name = nil, want error")
+	}
+}
+
+// widthFile describes an OpenType font file with CFF or CFF2 outlines, for
+// testing how advance widths are read.
+type widthFile struct {
+	// the top-level font matrix
+	matrix matrix.Matrix
+
+	// the per-FD font matrices, one per glyph; nil for a name-keyed CFF font
+	fds []matrix.Matrix
+
+	// the charstring advance widths, one per glyph (CFF only)
+	widths []float64
+
+	// the "head" units per em; 0 for a file without a "head" table
+	upm uint16
+
+	// the "hmtx" advance widths; nil for a file without an "hmtx" table
+	hmtx []funit.Uint16
+
+	// whether the outlines are CFF2 rather than CFF
+	cff2 bool
+}
+
+// encode assembles the font file described by spec.
+func (spec *widthFile) encode(t *testing.T) []byte {
+	t.Helper()
+
+	tables := make(map[string][]byte)
+	buf := &bytes.Buffer{}
+	if spec.cff2 {
+		n := len(spec.hmtx)
+		glyphs := make([]*cff.GlyphCFF2, n)
+		private := make([]*cff.PrivateCFF2, max(len(spec.fds), 1))
+		for i := range glyphs {
+			glyphs[i] = &cff.GlyphCFF2{}
+		}
+		for i := range private {
+			private[i] = &cff.PrivateCFF2{}
+		}
+		fdSelect := func(glyph.ID) int { return 0 }
+		if spec.fds != nil {
+			fdSelect = func(gid glyph.ID) int { return int(gid) }
+		}
+		font := &cff.FontCFF2{
+			FontMatrix: spec.matrix,
+			OutlinesCFF2: &cff.OutlinesCFF2{
+				Glyphs:       glyphs,
+				Private:      private,
+				FDSelect:     fdSelect,
+				FontMatrices: spec.fds,
+			},
+		}
+		if err := font.Write(buf); err != nil {
+			t.Fatal(err)
+		}
+		tables["CFF2"] = buf.Bytes()
+	} else {
+		n := len(spec.widths)
+		glyphs := make([]*cff.Glyph, n)
+		for i, w := range spec.widths {
+			name := ".notdef"
+			if i > 0 {
+				name = string(rune('a' + i - 1))
+			}
+			glyphs[i] = cff.NewGlyph(name, w)
+		}
+		o := &cff.Outlines{
+			Glyphs:   glyphs,
+			Private:  []*type1.PrivateDict{{}},
+			FDSelect: func(glyph.ID) int { return 0 },
+		}
+		if spec.fds != nil {
+			o.Private = make([]*type1.PrivateDict, n)
+			for i := range o.Private {
+				o.Private[i] = &type1.PrivateDict{}
+			}
+			o.FDSelect = func(gid glyph.ID) int { return int(gid) }
+			o.FontMatrices = spec.fds
+			o.ROS = &cid.SystemInfo{Registry: "Test", Ordering: "Test"}
+			o.GIDToCID = make([]cid.CID, n)
+			for i := range o.GIDToCID {
+				o.GIDToCID[i] = cid.CID(i)
+			}
+		} else {
+			o.Encoding = cff.StandardEncoding(glyphs)
+		}
+		font := &cff.Font{
+			FontInfo: &type1.FontInfo{FontName: "Test", FontMatrix: spec.matrix},
+			Outlines: o,
+		}
+		if err := font.Write(buf); err != nil {
+			t.Fatal(err)
+		}
+		tables["CFF "] = buf.Bytes()
+	}
+
+	if spec.upm != 0 {
+		tables["head"] = (&head.Info{UnitsPerEm: spec.upm}).Encode()
+	}
+	if spec.hmtx != nil {
+		info := &hmtx.Info{
+			Widths:       spec.hmtx,
+			GlyphExtents: make([]funit.Rect16, len(spec.hmtx)),
+		}
+		tables["hhea"], tables["hmtx"] = info.Encode()
+	}
+
+	out := &bytes.Buffer{}
+	if _, err := header.Write(out, header.ScalerTypeCFF, tables); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
+}
+
+// TestWidthRoundTrip checks that the advance widths of fonts with CFF and
+// CFF2 outlines survive a read-write-read cycle, for font matrices which do
+// not match the units per em of the font, or which are so large or so small
+// that the "hmtx" table cannot hold the widths they imply.
+func TestWidthRoundTrip(t *testing.T) {
+	scale := func(s float64) matrix.Matrix { return matrix.Matrix{s, 0, 0, s, 0, 0} }
+	cases := []struct {
+		name string
+		spec widthFile
+		want []float64 // the widths after the first read, in glyph design units
+	}{
+		{
+			name: "matching matrix",
+			spec: widthFile{matrix: scale(0.001), widths: []float64{500, 668}},
+			want: []float64{500, 668},
+		},
+		{
+			name: "fractional charstring widths",
+			spec: widthFile{matrix: scale(0.001), widths: []float64{500.25, 667.75}},
+			want: []float64{500.25, 667.75},
+		},
+		{
+			name: "negative charstring width",
+			spec: widthFile{matrix: scale(0.001), widths: []float64{-500, 668}},
+			want: []float64{0, 668},
+		},
+		{
+			// the charstring widths are measured against the font matrix,
+			// the hmtx table against the "head" units per em
+			name: "matrix inconsistent with head",
+			spec: widthFile{matrix: scale(0.001), widths: []float64{500, 501}, upm: 2048},
+			want: []float64{500, 501},
+		},
+		{
+			name: "matrix inconsistent with head, with hmtx",
+			spec: widthFile{matrix: scale(0.001), widths: []float64{500, 501}, upm: 2048, hmtx: []funit.Uint16{1024, 1025}},
+			want: []float64{500, 1025 / 2.048},
+		},
+		{
+			// 1/0.0003 is not a whole number of units per em
+			name: "units per em from matrix",
+			spec: widthFile{matrix: scale(0.0003), widths: []float64{500, 1000}, hmtx: []funit.Uint16{150, 300}},
+			want: []float64{cff.RoundWidth(150 / (0.0003 * 3333)), cff.RoundWidth(300 / (0.0003 * 3333))},
+		},
+		{
+			// a matrix close to the default must not be mistaken for it
+			name: "matrix near the default",
+			spec: widthFile{matrix: scale(1.0 / 1001), widths: []float64{500, 600}, upm: 1001, hmtx: []funit.Uint16{500, 600}},
+			want: []float64{500, 600},
+		},
+		{
+			name: "CID-keyed, matrix near the default",
+			spec: widthFile{matrix: scale(1.000001), fds: []matrix.Matrix{scale(0.001), scale(0.000999999)}, widths: []float64{500, 600}},
+			want: []float64{500, 600},
+		},
+		{
+			// the fuzzer found this one: the widths are 2*10^17 units per em
+			name: "huge matrix",
+			spec: widthFile{matrix: scale(3.0303030303e+11), widths: []float64{668, 668}},
+			want: []float64{0, 0},
+		},
+		{
+			// no multiple of 2^-16 maps to an hmtx width of 500
+			name: "huge matrix, with hmtx",
+			spec: widthFile{matrix: scale(1e10), widths: []float64{668, 668}, hmtx: []funit.Uint16{0, 500}},
+			want: []float64{0, 0},
+		},
+		{
+			// the charstring widths map to an hmtx width of 0 and are kept
+			name: "tiny matrix",
+			spec: widthFile{matrix: scale(1e-200), widths: []float64{668, 668}},
+			want: []float64{668, 668},
+		},
+		{
+			// the design width for an hmtx width of 500 is too large to store
+			name: "tiny matrix, with hmtx",
+			spec: widthFile{matrix: scale(1e-200), widths: []float64{668, 668}, hmtx: []funit.Uint16{0, 500}},
+			want: []float64{668, 0},
+		},
+		{
+			name: "mirrored matrix",
+			spec: widthFile{matrix: matrix.Matrix{-0.001, 0, 0, 0.001, 0, 0}, widths: []float64{500, -500}},
+			want: []float64{0, -500},
+		},
+		{
+			name: "mirrored matrix, with hmtx",
+			spec: widthFile{matrix: matrix.Matrix{-0.001, 0, 0, 0.001, 0, 0}, widths: []float64{500, 500}, hmtx: []funit.Uint16{500, 600}},
+			want: []float64{-500, -600},
+		},
+		{
+			// the advance has no horizontal component
+			name: "rotated matrix",
+			spec: widthFile{matrix: matrix.Matrix{0, 0.001, -0.001, 0, 0, 0}, widths: []float64{500, 600}, hmtx: []funit.Uint16{0, 600}},
+			want: []float64{500, 0},
+		},
+		{
+			name: "shear overflows",
+			spec: widthFile{matrix: matrix.Matrix{0.001, 1e200, 1e200, 0.001, 0, 0}, widths: []float64{500, 600}},
+			want: []float64{500, 600},
+		},
+		{
+			name: "CID-keyed, FDs at different scales",
+			spec: widthFile{matrix: matrix.Identity, fds: []matrix.Matrix{scale(0.001), scale(0.0005)}, widths: []float64{500, 1001}},
+			want: []float64{500, 1001},
+		},
+		{
+			name: "CID-keyed, composition overflows",
+			spec: widthFile{matrix: scale(1e200), fds: []matrix.Matrix{scale(0.001), scale(1e200)}, widths: []float64{500, 600}},
+			want: []float64{0, 0},
+		},
+		{
+			name: "CFF2, matching matrix",
+			spec: widthFile{cff2: true, matrix: scale(0.001), hmtx: []funit.Uint16{500, 668}},
+			want: []float64{500, 668},
+		},
+		{
+			name: "CFF2, matrix inconsistent with head",
+			spec: widthFile{cff2: true, matrix: scale(0.001), upm: 2048, hmtx: []funit.Uint16{1024, 1025}},
+			want: []float64{500, 1025 / 2.048},
+		},
+		{
+			name: "CFF2, huge matrix",
+			spec: widthFile{cff2: true, matrix: scale(1e10), hmtx: []funit.Uint16{0, 500}},
+			want: []float64{0, 0},
+		},
+		{
+			name: "CFF2, tiny matrix",
+			spec: widthFile{cff2: true, matrix: scale(1e-200), hmtx: []funit.Uint16{0, 500}},
+			want: []float64{0, 0},
+		},
+		{
+			name: "CFF2, composition overflows",
+			spec: widthFile{cff2: true, matrix: scale(1e200), fds: []matrix.Matrix{scale(1e200), scale(1e200)}, hmtx: []funit.Uint16{0, 500}},
+			want: []float64{0, 0},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			font1 := readBack(t, c.spec.encode(t))
+
+			if diff := cmp.Diff(c.want, font1.Widths(), fontCmpOptions(font1)...); diff != "" {
+				t.Errorf("widths (-want +got):\n%s", diff)
+			}
+
+			buf := &bytes.Buffer{}
+			if _, err := font1.Write(buf); err != nil {
+				t.Fatal(err)
+			}
+			font2 := readBack(t, buf.Bytes())
+			if diff := cmp.Diff(font1, font2, fontCmpOptions(font1)...); diff != "" {
+				t.Errorf("round trip failed (-old +new):\n%s", diff)
+			}
+		})
 	}
 }

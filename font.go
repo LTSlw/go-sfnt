@@ -37,6 +37,7 @@ import (
 	"seehuhn.de/go/sfnt/gvar"
 	"seehuhn.de/go/sfnt/head"
 	"seehuhn.de/go/sfnt/hvar"
+	"seehuhn.de/go/sfnt/internal/clamp"
 	"seehuhn.de/go/sfnt/mvar"
 	"seehuhn.de/go/sfnt/opentype/gdef"
 	"seehuhn.de/go/sfnt/opentype/gtab"
@@ -57,6 +58,38 @@ const (
 func validUnitsPerEm(x float64) bool {
 	r := math.Round(x)
 	return r >= MinUnitsPerEm && r <= MaxUnitsPerEm
+}
+
+// hmtxAdvance returns the value the "hmtx" table stores for an advance width
+// of w text space units, in a font with upm units per em.  The second result
+// is false if the rounded value does not fit the table's unsigned 16-bit
+// field.
+func hmtxAdvance(w, upm float64) (funit.Uint16, bool) {
+	h := math.Round(w * upm)
+	if !(h >= 0 && h <= math.MaxUint16) { // the negated test also rejects NaN
+		return 0, false
+	}
+	return funit.Uint16(h), true
+}
+
+// advanceFromHmtx converts the "hmtx" advance width h of a CFF or CFF2 glyph
+// to the glyph design units the outlines hold.  The glyph's design units map
+// to text space units by the factor q (see [cff.Outlines.GlyphAdvanceScale]),
+// and upm is the units per em of the font.
+//
+// The result is a width the CFF writer stores unchanged and turns back into
+// h, so that a font read from a file survives a write/read cycle.  Where the
+// font matrix leaves no such width, the width is dropped and 0 is returned.
+func advanceFromHmtx(h funit.Uint16, q, upm float64) float64 {
+	w := cff.RoundWidth(float64(h) / (q * upm))
+	if !cff.ValidWidth(w) {
+		return 0
+	}
+	// w*q is the text space width, computed as [Font.WidthsPDF] does
+	if back, ok := hmtxAdvance(w*q, upm); !ok || back != h {
+		return 0
+	}
+	return w
 }
 
 // Outlines represents the glyph data of a TrueType or OpenType font.
@@ -165,19 +198,22 @@ type Font struct {
 	// from [MinUnitsPerEm] to [MaxUnitsPerEm] can be written to a font file.
 	UnitsPerEm uint16
 
-	// metrics in font design units (UnitsPerEm)
-	Ascent  funit.Int16 // typographic ascender from the OS/2 table
-	Descent funit.Int16 // typographic descender from the OS/2 table; negative
-	LineGap funit.Int16 // typographic line gap from the OS/2 table
+	// Typographic metrics from the OS/2 table, in font design units.
+	// LineGap = Leading - Ascent + Descent.
+	Ascent  funit.Int16
+	Descent funit.Int16 // negative
+	LineGap funit.Int16
 
-	// Metrics from the hhea table.  If all three values are zero when writing,
-	// Ascent, Descent and LineGap are used instead.
+	// Metrics from the hhea table.  Fonts constructed in memory may leave
+	// all three values zero, in which case the typographic metrics are
+	// written in their place.
 	HheaAscent  funit.Int16
 	HheaDescent funit.Int16 // negative
 	HheaLineGap funit.Int16
 
-	// Windows clipping metrics from the OS/2 table.  If both values are zero
-	// when writing, they are derived from the font bounding box.
+	// Windows clipping metrics from the OS/2 table.  Fonts constructed in
+	// memory may leave both values zero, in which case the values are
+	// derived from the font bounding box when writing.
 	WinAscent  funit.Int16
 	WinDescent funit.Int16 // positive
 
@@ -293,6 +329,29 @@ func (f *Font) AsCFF2() *cff.FontCFF2 {
 // boxes.
 func (f *Font) FontBBox() rect.Rect {
 	return f.fontBBox(float64(f.UnitsPerEm))
+}
+
+// hheaMetrics returns the ascent, descent and line gap for the hhea table,
+// falling back to the typographic metrics when the hhea values are unset.
+func (f *Font) hheaMetrics() (ascent, descent, lineGap funit.Int16) {
+	if f.HheaAscent == 0 && f.HheaDescent == 0 && f.HheaLineGap == 0 {
+		return f.Ascent, f.Descent, f.LineGap
+	}
+	return f.HheaAscent, f.HheaDescent, f.HheaLineGap
+}
+
+// winMetrics returns the Windows ascent and descent for the OS/2 table,
+// deriving them from the font bounding box when the values are unset.
+func (f *Font) winMetrics() (ascent, descent funit.Int16) {
+	if f.WinAscent == 0 && f.WinDescent == 0 {
+		// TODO(voss): larger values may be needed, if GPOS rules move some
+		// glyphs outside this range.
+		bbox := f.FontBBox()
+		ascent = clamp.Int16[funit.Int16](math.Ceil(bbox.URy))
+		descent = clamp.Int16[funit.Int16](math.Ceil(-bbox.LLy))
+		return ascent, descent
+	}
+	return f.WinAscent, f.WinDescent
 }
 
 // FontBBoxPDF returns the font bounding box in PDF glyph space units.
@@ -489,7 +548,7 @@ func (f *Font) glyphHeight(gid glyph.ID) funit.Int16 {
 	if !(h > 0) { // the negated test also rejects NaN
 		return 0
 	}
-	return clampInt16(h)
+	return clamp.Int16[funit.Int16](h)
 }
 
 // measureHeight returns the height of the first of the given characters the

@@ -181,10 +181,15 @@ func Read(r io.Reader, budget *membudget.Budget) (*Font, error) {
 		}
 		winTab, winConf := nameInfo.Windows.Choose(language.AmericanEnglish)
 		macTab, macConf := nameInfo.Mac.Choose(language.AmericanEnglish)
-		nameTable = winTab
-		if winConf < language.High && macConf > winConf || nameTable == nil {
-			nameTable = macTab
+		primary, fallback, fallbackConf := winTab, macTab, macConf
+		if (winConf < language.High && macConf > winConf) || winTab == nil {
+			primary, fallback, fallbackConf = macTab, winTab, winConf
 		}
+		if fallbackConf < language.Low {
+			// names in an unrelated language
+			fallback = nil
+		}
+		nameTable = name.Merged(primary, fallback)
 	}
 
 	var postInfo *post.Info
@@ -248,11 +253,9 @@ func Read(r io.Reader, budget *membudget.Budget) (*Font, error) {
 			// hmtx widths are in UnitsPerEm.  Convert to CFF2 design units
 			// (which is what OutlinesCFF2.Widths holds) using each glyph's
 			// effective font matrix.
-			for i, w := range hmtxInfo.Widths {
+			for i, h := range hmtxInfo.Widths {
 				q := o.GlyphAdvanceScale(cff2Font.FontMatrix, glyph.ID(i))
-				if d := q * cff2UPM; d != 0 {
-					o.Widths[i] = float64(w) / d
-				}
+				o.Widths[i] = advanceFromHmtx(h, q, cff2UPM)
 			}
 		}
 	case dir.ScalerType == header.ScalerTypeCFF:
@@ -270,25 +273,26 @@ func Read(r io.Reader, budget *membudget.Budget) (*Font, error) {
 
 		if numGlyphs != 0 && len(cffInfo.Glyphs) != numGlyphs {
 			return nil, errors.New("sfnt: cff glyph count mismatch")
-		} else if hmtxInfo != nil && len(hmtxInfo.Widths) > 0 {
-			// hmtx widths are in UnitsPerEm.  Convert to CFF design units
-			// (which is what cff.Glyph.Width holds) using each glyph's effective
-			// font matrix.  For the typical case (UnitsPerEm == 1/FontMatrix[0])
-			// this is a no-op.
-			upm := deriveUnitsPerEm(cffInfo.Outlines, cffInfo.FontInfo, headInfo)
-			for i, w := range hmtxInfo.Widths {
-				q := cffInfo.Outlines.GlyphAdvanceScale(cffInfo.FontInfo.FontMatrix, glyph.ID(i))
-				if d := q * upm; d != 0 {
-					cffInfo.Glyphs[i].Width = float64(w) / d
-				}
-			}
 		}
 
-		// advance widths are stored unsigned in hmtx; snap a negative
-		// CFF charstring width to zero so it survives a write/read cycle
-		for _, g := range cffInfo.Glyphs {
-			if g.Width < 0 {
-				g.Width = 0
+		// The hmtx table is where an OpenType font keeps its advance widths,
+		// and the writer always stores them there, in units of UnitsPerEm.
+		// A charstring width is kept if the writer would turn it into the
+		// hmtx width, so that fractional widths survive; otherwise the hmtx
+		// width is authoritative.  Where the table is missing, as in a font
+		// embedded in a PDF file, the hmtx width is the one the writer would
+		// store, and a charstring width the table cannot hold, a negative
+		// one for example, is dropped.
+		upm := deriveUnitsPerEm(cffInfo.Outlines, cffInfo.FontInfo, headInfo)
+		for i, g := range cffInfo.Glyphs {
+			q := cffInfo.Outlines.GlyphAdvanceScale(cffInfo.FontInfo.FontMatrix, glyph.ID(i))
+			h, ok := hmtxAdvance(g.Width*q, upm)
+			if hmtxInfo != nil && len(hmtxInfo.Widths) > 0 {
+				ok = ok && h == hmtxInfo.Widths[i]
+				h = hmtxInfo.Widths[i]
+			}
+			if !ok {
+				g.Width = advanceFromHmtx(h, q, upm)
 			}
 		}
 	case dir.ScalerType == header.ScalerTypeTrueType, dir.ScalerType == header.ScalerTypeApple:
@@ -458,16 +462,9 @@ func Read(r io.Reader, budget *membudget.Budget) (*Font, error) {
 		info.Descent = hmtxInfo.Descent
 		info.LineGap = hmtxInfo.LineGap
 	}
-	if info.HheaAscent == 0 && info.HheaDescent == 0 && info.HheaLineGap == 0 {
-		info.HheaAscent = info.Ascent
-		info.HheaDescent = info.Descent
-		info.HheaLineGap = info.LineGap
-	}
-	if info.WinAscent == 0 && info.WinDescent == 0 {
-		bbox := info.FontBBox()
-		info.WinAscent = clampInt16(math.Ceil(bbox.URy))
-		info.WinDescent = clampInt16(math.Ceil(-bbox.LLy))
-	}
+	// make the write-time fallbacks explicit so that a round trip is stable
+	info.HheaAscent, info.HheaDescent, info.HheaLineGap = info.hheaMetrics()
+	info.WinAscent, info.WinDescent = info.winMetrics()
 
 	if os2Info != nil {
 		info.CapHeight = os2Info.CapHeight
@@ -800,12 +797,15 @@ func getCFFVersion(fontInfo *type1.FontInfo) (head.Version, bool) {
 // glyph matrix m, a zero matrix standing for "no matrix available".  A value a
 // font file cannot store is skipped, since every glyph metric is measured in
 // these units.  Fallback is the conventional 1000.
+//
+// The result is a whole number, since the widths read are converted using the
+// value the font will be written with.
 func unitsPerEmFrom(headInfo *head.Info, m matrix.Matrix) float64 {
 	if headInfo != nil && validUnitsPerEm(float64(headInfo.UnitsPerEm)) {
 		return float64(headInfo.UnitsPerEm)
 	}
 	if m[0] != 0 && validUnitsPerEm(1/m[0]) {
-		return 1 / m[0]
+		return math.Round(1 / m[0])
 	}
 	return 1000
 }

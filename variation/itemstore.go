@@ -20,7 +20,6 @@ import (
 	"errors"
 	"math"
 
-	"seehuhn.de/go/membudget"
 	"seehuhn.de/go/sfnt/parser"
 )
 
@@ -49,6 +48,9 @@ type ItemVariationData struct {
 // ReadItemVariationStore reads a format 1 item variation store located at
 // the absolute file position pos.  Allocations are charged against the
 // parser's budget.
+//
+// An ItemVariationData subtable without region columns is read without rows,
+// since its rows carry no deltas.
 func ReadItemVariationStore(p *parser.Parser, pos int64) (*ItemVariationStore, error) {
 	if err := p.SeekPos(pos); err != nil {
 		return nil, err
@@ -67,7 +69,7 @@ func ReadItemVariationStore(p *parser.Parser, pos int64) (*ItemVariationStore, e
 	if err := checkCount(p, dataCount, 4); err != nil {
 		return nil, err
 	}
-	dataOffsets, err := membudget.AllocSlice[uint32](p.Budget, dataCount)
+	dataOffsets, err := p.Budget.AllocSlice[uint32](dataCount)
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +91,7 @@ func ReadItemVariationStore(p *parser.Parser, pos int64) (*ItemVariationStore, e
 	if dataCount == 0 {
 		return s, nil
 	}
-	s.Data, err = membudget.AllocSlice[*ItemVariationData](p.Budget, dataCount)
+	s.Data, err = p.Budget.AllocSlice[*ItemVariationData](dataCount)
 	if err != nil {
 		return nil, err
 	}
@@ -122,6 +124,12 @@ func readRegionList(p *parser.Parser, pos int64) ([]Region, error) {
 	if regionCount == 0 {
 		return nil, nil
 	}
+	// The axis count must match the one in 'fvar', which is at least 1 in a
+	// variable font.  Regions without axes would also occupy no space in the
+	// file, so that their number would not be bounded by the input size.
+	if axisCount == 0 {
+		return nil, errors.New("variation: variation regions without axes")
+	}
 
 	// each region axis is 3 int16 values
 	if err := checkCount(p, regionCount*axisCount, 6); err != nil {
@@ -131,12 +139,12 @@ func readRegionList(p *parser.Parser, pos int64) ([]Region, error) {
 		return nil, err
 	}
 
-	regions, err := membudget.AllocSlice[Region](p.Budget, regionCount)
+	regions, err := p.Budget.AllocSlice[Region](regionCount)
 	if err != nil {
 		return nil, err
 	}
 	for i := range regions {
-		axes, err := membudget.AllocSlice[RegionAxis](p.Budget, axisCount)
+		axes, err := p.Budget.AllocSlice[RegionAxis](axisCount)
 		if err != nil {
 			return nil, err
 		}
@@ -183,7 +191,7 @@ func readItemVariationData(p *parser.Parser, pos int64, regionCount int) (*ItemV
 	}
 	var regionIndexes []uint16
 	if regionIndexCount > 0 {
-		regionIndexes, err = membudget.AllocSlice[uint16](p.Budget, regionIndexCount)
+		regionIndexes, err = p.Budget.AllocSlice[uint16](regionIndexCount)
 		if err != nil {
 			return nil, err
 		}
@@ -197,6 +205,14 @@ func readItemVariationData(p *parser.Parser, pos int64, regionCount int) (*ItemV
 			return nil, errors.New("variation: region index out of range")
 		}
 		regionIndexes[i] = idx
+	}
+
+	// Rows without columns hold no deltas and occupy no space in the file, so
+	// that their number is not bounded by the input size.  They are dropped:
+	// [ItemVariationStore.Evaluate] yields 0 for a missing row, as it does
+	// for an empty one.
+	if regionIndexCount == 0 {
+		return &ItemVariationData{}, nil
 	}
 
 	wideBytes, narrowBytes := 2, 1
@@ -214,7 +230,7 @@ func readItemVariationData(p *parser.Parser, pos int64, regionCount int) (*ItemV
 
 	var deltas [][]int32
 	if itemCount > 0 {
-		deltas, err = membudget.AllocSlice[[]int32](p.Budget, itemCount)
+		deltas, err = p.Budget.AllocSlice[[]int32](itemCount)
 		if err != nil {
 			return nil, err
 		}
@@ -222,7 +238,7 @@ func readItemVariationData(p *parser.Parser, pos int64, regionCount int) (*ItemV
 	for i := range deltas {
 		var row []int32
 		if regionIndexCount > 0 {
-			row, err = membudget.AllocSlice[int32](p.Budget, regionIndexCount)
+			row, err = p.Budget.AllocSlice[int32](regionIndexCount)
 			if err != nil {
 				return nil, err
 			}
